@@ -11,8 +11,69 @@ function go($msg, $type = 'success', $examId = 0) {
 }
 
 /**
+ * Parse a register number such as IGW23AIM001 or LIGW23AIM0015 into structured parts:
+ * - year: Admission year (e.g., 21, 22, 23, 25, 26)
+ * - dept: Department code (e.g., AIM, ALM, BBA, BCA, CE, CS, EEE)
+ * - is_lateral: 0 for regular (IGW), 1 for lateral entry (LIGW)
+ * - roll: Numeric roll number
+ */
+function parseRegisterNo(string $regNo): array {
+    $clean = strtoupper(trim($regNo));
+    // Matches optional leading 'L' (Lateral Entry), college code (e.g. IGW), 2-digit year, letters for dept, and trailing digits
+    if (preg_match('/^(L?)([A-Z]+)(\d{2})([A-Z]+)(\d+)$/', $clean, $m)) {
+        return [
+            'matched'    => true,
+            'is_lateral' => ($m[1] === 'L') ? 1 : 0,
+            'college'    => $m[2],
+            'year'       => (int)$m[3],
+            'dept'       => $m[4],
+            'roll'       => (int)$m[5],
+            'raw'        => $clean,
+        ];
+    }
+    return [
+        'matched'    => false,
+        'is_lateral' => 0,
+        'college'    => '',
+        'year'       => PHP_INT_MAX,
+        'dept'       => $clean,
+        'roll'       => PHP_INT_MAX,
+        'raw'        => $clean,
+    ];
+}
+
+/**
+ * Sort comparator:
+ * 1. Year ascending (21, 22, 23, 25, 26...)
+ * 2. Department ascending (AIM, BBA, BCA, CE, CS, EEE...)
+ * 3. Regular (IGW = 0) before Lateral Entry (LIGW = 1) within the SAME year & department
+ * 4. Roll number ascending (1, 2, 3, ..., 15, 16...)
+ */
+function compareRegisterNumbers(string $regA, string $regB): int {
+    $a = parseRegisterNo($regA);
+    $b = parseRegisterNo($regB);
+
+    if ($a['matched'] && $b['matched']) {
+        if ($a['year'] !== $b['year']) {
+            return $a['year'] <=> $b['year'];
+        }
+        $deptCmp = strcmp($a['dept'], $b['dept']);
+        if ($deptCmp !== 0) {
+            return $deptCmp;
+        }
+        if ($a['is_lateral'] !== $b['is_lateral']) {
+            return $a['is_lateral'] <=> $b['is_lateral'];
+        }
+        if ($a['roll'] !== $b['roll']) {
+            return $a['roll'] <=> $b['roll'];
+        }
+    }
+    return strnatcasecmp($a['raw'], $b['raw']);
+}
+
+/**
  * Parse uploaded CSV or Excel (.xlsx) file containing Register Number and Student Name.
- * Automatically sorts students in ascending order by Register Number.
+ * Automatically sorts students by Year -> Department -> Regular (IGW) then Lateral (LIGW) -> Roll Number.
  */
 function parseStudentFile(array $file): array {
     if (!isset($file['tmp_name']) || $file['error'] !== UPLOAD_ERR_OK) {
@@ -161,8 +222,8 @@ function parseStudentFile(array $file): array {
         throw new RuntimeException('No valid student rows found in the uploaded file.');
     }
 
-    // Sort strictly by Register Number ascending (natural + lexicographical)
-    usort($students, fn($a, $b) => strnatcasecmp($a['register_no'], $b['register_no']));
+    // Sort strictly by Year -> Department -> Regular (IGW) then Lateral (LIGW) -> Roll Number
+    usort($students, fn($a, $b) => compareRegisterNumbers($a['register_no'], $b['register_no']));
 
     return $students;
 }
@@ -171,10 +232,11 @@ if (isset($_GET['download_sample'])) {
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="sample_students.csv"');
     echo "register_no,student_name\n";
-    echo "IGW23CS026,Student One\n";
-    echo "IGW23CS027,Student Two\n";
-    echo "IGW23CS028,Student Three\n";
-    echo "IGW23CS029,Student Four\n";
+    echo "IGW23AIM001,Student One\n";
+    echo "IGW23AIM002,Student Two\n";
+    echo "LIGW23AIM015,Lateral Student One\n";
+    echo "LIGW23AIM016,Lateral Student Two\n";
+    echo "IGW23CS001,CS Student One\n";
     exit;
 }
 
@@ -218,7 +280,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->rollBack();
             go('This subject code is already added for the selected examination, or the file data is invalid.', 'error', $examId);
         }
-        go("Subject $code added successfully with $count students (sorted ascending).", 'success', $examId);
+        go("Subject $code added successfully with $count students (sorted by Year, Department, IGW then LIGW).", 'success', $examId);
     }
 
     if ($action === 'delete_subject') {
@@ -258,16 +320,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!$examId || !$subjects || !$rooms) go('Add at least one subject and one room before generating.', 'error', $examId);
 
-        // Load student queues strictly sorted in ascending Register Number order
+        // Load student queues strictly sorted by Year -> Department -> Regular (IGW) then Lateral (LIGW) -> Roll Number
         $studentQueues = [];
-        $stuStmt = $pdo->prepare("SELECT student_no, register_no, student_name FROM subject_students WHERE subject_id = ? ORDER BY register_no ASC, student_no ASC");
+        $stuStmt = $pdo->prepare("SELECT student_no, register_no, student_name FROM subject_students WHERE subject_id = ? ORDER BY student_no ASC");
         foreach ($subjects as $s) {
             $stuStmt->execute([$s['id']]);
             $list = $stuStmt->fetchAll();
             if (count($list) !== (int)$s['student_count']) {
                 go("Student list count mismatch for {$s['subject_code']}. Re-upload the subject student file.", 'error', $examId);
             }
-            usort($list, fn($a, $b) => strnatcasecmp($a['register_no'], $b['register_no']));
+            usort($list, fn($a, $b) => compareRegisterNumbers($a['register_no'], $b['register_no']));
             $studentQueues[$s['subject_code']] = $list;
         }
 
@@ -292,7 +354,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             go("Insufficient room capacity. Students: $totalStudents; available capacity: $totalCapacity.", 'error', $examId);
         }
 
-        // Fill Room 1 completely (Row 1 -> Row 2 -> Row 3) with ascending register numbers, then move to Room 2, etc.
+        // Fill Room 1 completely (Row 1 -> Row 2 -> Row 3) sequentially, then move to Room 2, etc.
         $remaining = [];
         foreach ($subjects as $s) $remaining[$s['subject_code']] = (int)$s['student_count'];
         $studentIndices = array_fill_keys(array_keys($remaining), 0);
@@ -384,7 +446,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->rollBack();
             go('Could not save seating arrangement: ' . $e->getMessage(), 'error', $examId);
         }
-        go("Seating arrangement generated successfully for $placed students in ascending register order.", 'success', $examId);
+        go("Seating arrangement generated successfully for $placed students (Year → Department → IGW then LIGW).", 'success', $examId);
     }
 }
 
@@ -400,11 +462,15 @@ if ($selectedExam) {
     $st->execute([$selectedExam]);
     $subjects = $st->fetchAll();
 
-    $stStu = $pdo->prepare("SELECT ss.*, s.subject_code FROM subject_students ss JOIN subjects s ON s.id = ss.subject_id WHERE s.exam_id = ? ORDER BY s.subject_code ASC, ss.register_no ASC");
+    $stStu = $pdo->prepare("SELECT ss.*, s.subject_code FROM subject_students ss JOIN subjects s ON s.id = ss.subject_id WHERE s.exam_id = ? ORDER BY s.subject_code ASC, ss.student_no ASC");
     $stStu->execute([$selectedExam]);
     foreach ($stStu->fetchAll() as $sr) {
         $subjectStudents[$sr['subject_id']][] = $sr;
     }
+    foreach ($subjectStudents as &$list) {
+        usort($list, fn($a, $b) => compareRegisterNumbers($a['register_no'], $b['register_no']));
+    }
+    unset($list);
 }
 $seatRows = [];
 if ($selectedExam) {
@@ -426,11 +492,11 @@ foreach ($seatRows as $row) {
     $byRoom[$rName][$row['bench_no']][] = $row;
     $byRoomSubject[$rName][$row['subject_code']][] = $row;
 }
-// Ensure subject-wise lists inside every room are sorted strictly ascending by register_no
+// Ensure subject-wise lists inside every room follow Year -> Department -> IGW then LIGW -> Roll Number
 foreach ($byRoomSubject as $rName => &$subGroups) {
     ksort($subGroups);
     foreach ($subGroups as $sCode => &$sList) {
-        usort($sList, fn($a, $b) => strnatcasecmp($a['register_no'], $b['register_no']));
+        usort($sList, fn($a, $b) => compareRegisterNumbers($a['register_no'], $b['register_no']));
     }
 }
 unset($subGroups, $sList);
@@ -463,6 +529,7 @@ table{width:100%;border-collapse:collapse;font-size:14px;margin-bottom:14px}th,t
 .bench strong{display:block;margin-bottom:6px;font-size:13px;color:#1e293b}
 .seat{font-size:13px;padding:6px 8px;margin:4px 0;background:#eaf1fb;border-radius:5px;line-height:1.35}
 .seat .reg{font-weight:bold;color:#0f294a}.seat .sname{color:#334155;font-size:12px}
+.badge-lat{display:inline-block;background:#fef3c7;color:#92400e;font-size:10px;font-weight:bold;padding:1px 5px;border-radius:4px;margin-left:4px;vertical-align:middle}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.actions button{margin-top:0}
 details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-size:13px;font-weight:bold}
 .stu-list{max-height:180px;overflow-y:auto;border:1px solid var(--line);border-radius:6px;margin-top:6px;padding:6px;background:#f8fafc;font-size:12px}
@@ -504,7 +571,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 <input name="subject_code" placeholder="e.g. CS301" required>
 <label>Student list file (.csv or .xlsx)</label>
 <input type="file" name="student_file" accept=".csv,.xlsx" required>
-<p class="muted" style="margin:6px 0 0">Columns: <b>Register Number</b>, <b>Student Name</b>. <a href="?download_sample=1">Download sample CSV</a></p>
+<p class="muted" style="margin:6px 0 0">Columns: <b>Register Number</b>, <b>Student Name</b>. Sorted by Year → Dept → IGW then LIGW. <a href="?download_sample=1">Download sample CSV</a></p>
 <button type="submit">Upload & Add Subject</button>
 </form>
 </section>
@@ -527,7 +594,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 <h3>Subjects</h3>
 <?php if($subjects): ?>
 <table>
-<tr><th>Subject code</th><th>Students</th><th>Student Register List (Ascending)</th><th>Action</th></tr>
+<tr><th>Subject code</th><th>Students</th><th>Student Register List (Year → Dept → IGW + LIGW)</th><th>Action</th></tr>
 <?php foreach($subjects as $s): $stuList = $subjectStudents[$s['id']] ?? []; ?>
 <tr>
   <td><strong><?=h($s['subject_code'])?></strong></td>
@@ -536,8 +603,8 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
     <details>
       <summary>View <?=count($stuList)?> students</summary>
       <div class="stu-list">
-        <?php foreach($stuList as $idx => $stItem): ?>
-          <div><?=($idx + 1)?>. <b><?=h($stItem['register_no'])?></b> — <?=h($stItem['student_name'])?></div>
+        <?php foreach($stuList as $idx => $stItem): $parsed = parseRegisterNo($stItem['register_no']); ?>
+          <div><?=($idx + 1)?>. <b><?=h($stItem['register_no'])?></b><?php if($parsed['is_lateral']): ?><span class="badge-lat">LE</span><?php endif; ?> — <?=h($stItem['student_name'])?></div>
         <?php endforeach; ?>
       </div>
     </details>
@@ -564,7 +631,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 
 <section class="card no-print">
 <h2>6. Generate Seating Arrangement</h2>
-<p class="muted">Fills Room 1 (Row 1 → Row 2 → Row 3) sequentially in ascending register number order, then moves to the next room.</p>
+<p class="muted">Fills Room 1 (Row 1 → Row 2 → Row 3) sequentially in Year → Department → Regular (IGW) then Lateral (LIGW) → Ascending Roll order, then moves to the next room.</p>
 <form method="post" onsubmit="return confirm('Generate or replace the seating arrangement for this examination?')">
 <input type="hidden" name="action" value="generate"><input type="hidden" name="exam_id" value="<?=h($selectedExam)?>">
 <button type="submit" <?=(!$subjects || !$rooms)?'disabled':''?>>Generate Seating Arrangement</button>
@@ -601,10 +668,10 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
       ?>
         <div class="bench">
           <strong>Row <?= $rowNum ?> — Bench <?= $rowBenchIndex ?> <span class="muted">(Desk #<?= $bNo ?>)</span></strong>
-          <?php foreach($benches[$bNo] as $seat): ?>
+          <?php foreach($benches[$bNo] as $seat): $parsed = parseRegisterNo($seat['register_no']); ?>
             <div class="seat">
               Seat <?=h($seat['seat_no'])?>: <b><?=h($seat['subject_code'])?></b><br>
-              <span class="reg"><?=h($seat['register_no'])?></span><br>
+              <span class="reg"><?=h($seat['register_no'])?></span><?php if($parsed['is_lateral']): ?><span class="badge-lat">LE</span><?php endif; ?><br>
               <span class="sname"><?=h($seat['student_name'])?></span>
             </div>
           <?php endforeach; ?>
@@ -619,7 +686,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 </div>
 <?php endforeach; ?>
 
-<h2 style="margin-top:24px">Room-wise & Subject-wise Register List (Ascending Order)</h2>
+<h2 style="margin-top:24px">Room-wise & Subject-wise Register List (Year → Dept → IGW + LIGW)</h2>
 <?php foreach($byRoomSubject as $roomName => $subGroups):
     $totB = $roomDesksMap[$roomName] ?? 15;
     $pRow = max(1, (int)ceil($totB / 3));
@@ -634,7 +701,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
     <table>
       <tr>
         <th style="width:55px">Sl.No</th>
-        <th style="width:160px">Register Number</th>
+        <th style="width:170px">Register Number</th>
         <th>Student Name</th>
         <th style="width:85px">Row</th>
         <th style="width:95px">Bench</th>
@@ -644,10 +711,11 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
           $bNo  = (int)$sr['bench_no'];
           $rNum = (int)ceil($bNo / $pRow);
           $rbNo = $bNo - ($rNum - 1) * $pRow;
+          $parsed = parseRegisterNo($sr['register_no']);
       ?>
       <tr>
         <td><?=($idx + 1)?></td>
-        <td><b><?=h($sr['register_no'])?></b></td>
+        <td><b><?=h($sr['register_no'])?></b><?php if($parsed['is_lateral']): ?><span class="badge-lat">LE</span><?php endif; ?></td>
         <td><?=h($sr['student_name'])?></td>
         <td>Row <?=$rNum?></td>
         <td>Bench <?=$rbNo?></td>
