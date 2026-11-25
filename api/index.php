@@ -26,7 +26,6 @@ function parseStudentFile(array $file): array {
     if ($ext === 'csv' || $ext === 'txt') {
         $raw = file_get_contents($file['tmp_name']);
         if ($raw === false) throw new RuntimeException('Unable to read uploaded CSV file.');
-        // Strip UTF-8 BOM if present
         $raw = preg_replace('/^\xEF\xBB\xBF/', '', $raw);
         $lines = preg_split('/\r\n|\r|\n/', $raw);
         foreach ($lines as $line) {
@@ -42,7 +41,6 @@ function parseStudentFile(array $file): array {
             throw new RuntimeException('Could not open the uploaded .xlsx file.');
         }
 
-        // Load shared strings
         $sharedStrings = [];
         $ssXml = $zip->getFromName('xl/sharedStrings.xml');
         if ($ssXml !== false) {
@@ -60,7 +58,6 @@ function parseStudentFile(array $file): array {
             }
         }
 
-        // Find first worksheet
         $sheetXml = $zip->getFromName('xl/worksheets/sheet1.xml');
         if ($sheetXml === false) {
             for ($i = 0; $i < $zip->numFiles; $i++) {
@@ -121,7 +118,6 @@ function parseStudentFile(array $file): array {
         throw new RuntimeException('The uploaded file is empty.');
     }
 
-    // Detect header row & column indices
     $regCol = 0;
     $nameCol = 1;
     $startIdx = 0;
@@ -169,7 +165,6 @@ function parseStudentFile(array $file): array {
     return $students;
 }
 
-// Download sample CSV template
 if (isset($_GET['download_sample'])) {
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="sample_students.csv"');
@@ -261,7 +256,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!$examId || !$subjects || !$rooms) go('Add at least one subject and one room before generating.', 'error', $examId);
 
-        // Load student queues (ordered by student_no) per subject code
+        // Load student queues ordered by student_no (register number order from file)
         $studentQueues = [];
         $stuStmt = $pdo->prepare("SELECT student_no, register_no, student_name FROM subject_students WHERE subject_id = ? ORDER BY student_no ASC");
         foreach ($subjects as $s) {
@@ -273,14 +268,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $studentQueues[$s['subject_code']] = $list;
         }
 
-        // Each room can hold at most 30 students and at most two students per desk.
         $roomState = [];
         foreach ($rooms as $r) {
+            $desks = (int)$r['desk_count'];
+            $cap = min(30, $desks * 2);
+            $usableBenches = min($desks, (int)ceil($cap / 2));
             $roomState[$r['id']] = [
                 'id' => (int)$r['id'],
                 'name' => $r['room_name'],
-                'desks' => (int)$r['desk_count'],
-                'capacity' => min(30, (int)$r['desk_count'] * 2),
+                'desks' => $desks,
+                'usable_benches' => $usableBenches,
+                'capacity' => $cap,
                 'benches' => []
             ];
         }
@@ -291,78 +289,73 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             go("Insufficient room capacity. Students: $totalStudents; available capacity: $totalCapacity.", 'error', $examId);
         }
 
-        // Assign one subject at a time, prioritising the subject with the largest remaining count.
-        // A bench may contain two students only when their subject codes differ.
+        // Fill sequentially: Room 1 -> Room 2..., and inside each room:
+        // Row 1 (Bench 1..N) -> Row 2 (Bench 1..N) -> Row 3 (Bench 1..N).
+        // Each bench gets 2 students of different subjects before moving to the next bench in that row.
         $remaining = [];
         foreach ($subjects as $s) $remaining[$s['subject_code']] = (int)$s['student_count'];
         $studentIndices = array_fill_keys(array_keys($remaining), 0);
         $placed = 0;
-        $failure = null;
 
-        while ($placed < $totalStudents) {
-            arsort($remaining);
-            $code = null;
-            foreach ($remaining as $candidate => $left) {
-                if ($left > 0) { $code = $candidate; break; }
-            }
-            if ($code === null) break;
+        foreach ($roomState as $rid => &$room) {
+            if ($placed >= $totalStudents) break;
+            $roomOccupied = 0;
 
-            $bestRoomId = null; $bestBench = null; $bestScore = -INF;
-            foreach ($roomState as $rid => $room) {
-                $occupied = 0;
-                foreach ($room['benches'] as $bench) $occupied += count($bench);
-                if ($occupied >= $room['capacity']) continue;
+            for ($b = 0; $b < $room['usable_benches']; $b++) {
+                if ($placed >= $totalStudents || $roomOccupied >= $room['capacity']) break;
 
-                $subjectBenches = 0;
-                foreach ($room['benches'] as $bench) {
-                    foreach ($bench as $seat) if ($seat['subject'] === $code) { $subjectBenches++; break; }
+                $bench = [];
+                // Seat 1 on this bench: pick subject with highest remaining count
+                arsort($remaining);
+                $sub1 = null;
+                foreach ($remaining as $cand => $left) {
+                    if ($left > 0) { $sub1 = $cand; break; }
                 }
-                if ($subjectBenches >= $room['desks']) continue;
+                if ($sub1 !== null) {
+                    $stuObj = $studentQueues[$sub1][$studentIndices[$sub1]++];
+                    $bench[] = [
+                        'subject' => $sub1,
+                        'student_no' => $stuObj['student_no'],
+                        'register_no' => $stuObj['register_no'],
+                        'student_name' => $stuObj['student_name']
+                    ];
+                    $remaining[$sub1]--;
+                    $placed++;
+                    $roomOccupied++;
+                }
 
-                $candidateBench = null;
-                foreach ($room['benches'] as $bno => $bench) {
-                    if (count($bench) === 1 && $bench[0]['subject'] !== $code) {
-                        $candidateBench = $bno; break;
+                // Seat 2 on the SAME bench: pick a DIFFERENT subject with highest remaining count
+                if ($placed < $totalStudents && $roomOccupied < $room['capacity'] && $sub1 !== null) {
+                    arsort($remaining);
+                    $sub2 = null;
+                    foreach ($remaining as $cand => $left) {
+                        if ($left > 0 && $cand !== $sub1) { $sub2 = $cand; break; }
+                    }
+                    if ($sub2 !== null) {
+                        $stuObj = $studentQueues[$sub2][$studentIndices[$sub2]++];
+                        $bench[] = [
+                            'subject' => $sub2,
+                            'student_no' => $stuObj['student_no'],
+                            'register_no' => $stuObj['register_no'],
+                            'student_name' => $stuObj['student_name']
+                        ];
+                        $remaining[$sub2]--;
+                        $placed++;
+                        $roomOccupied++;
                     }
                 }
-                if ($candidateBench === null) {
-                    if (count($room['benches']) < $room['desks']) {
-                        $candidateBench = count($room['benches']);
-                    }
-                }
-                if ($candidateBench === null) continue;
 
-                $free = $room['capacity'] - $occupied;
-                $score = $free * 100 - $subjectBenches * 10 + (isset($room['benches'][$candidateBench]) ? 5 : 0);
-                if ($score > $bestScore) {
-                    $bestScore = $score; $bestRoomId = $rid; $bestBench = $candidateBench;
+                if (!empty($bench)) {
+                    $room['benches'][$b] = $bench;
                 }
             }
-
-            if ($bestRoomId === null) {
-                $failure = "Could not place all students without seating two students of the same subject on one bench. " .
-                    "Placed $placed of $totalStudents. Add more rooms/desks or review subject counts.";
-                break;
-            }
-
-            if (!isset($roomState[$bestRoomId]['benches'][$bestBench])) {
-                $roomState[$bestRoomId]['benches'][$bestBench] = [];
-            }
-            $idx = $studentIndices[$code];
-            $stuObj = $studentQueues[$code][$idx];
-            $studentIndices[$code]++;
-
-            $roomState[$bestRoomId]['benches'][$bestBench][] = [
-                'subject' => $code,
-                'student_no' => $stuObj['student_no'],
-                'register_no' => $stuObj['register_no'],
-                'student_name' => $stuObj['student_name']
-            ];
-            $remaining[$code]--;
-            $placed++;
         }
+        unset($room);
 
-        if ($failure) go($failure, 'error', $examId);
+        if ($placed < $totalStudents) {
+            go("Could not seat all students sequentially without placing the same subject together on a bench. " .
+               "Placed $placed of $totalStudents. Add more rooms/desks or balance subject counts.", 'error', $examId);
+        }
 
         $pdo->beginTransaction();
         try {
@@ -390,7 +383,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->rollBack();
             go('Could not save seating arrangement: ' . $e->getMessage(), 'error', $examId);
         }
-        go("Seating arrangement generated successfully for $placed students.", 'success', $examId);
+        go("Seating arrangement generated successfully for $placed students in 3-row sequential order.", 'success', $examId);
     }
 }
 
@@ -414,12 +407,21 @@ if ($selectedExam) {
 }
 $seatRows = [];
 if ($selectedExam) {
-    $st = $pdo->prepare("SELECT s.*, r.room_name FROM seating s JOIN rooms r ON r.id=s.room_id WHERE s.exam_id=? ORDER BY r.room_name, s.bench_no, s.seat_no");
+    $st = $pdo->prepare("SELECT s.*, r.room_name, r.desk_count FROM seating s JOIN rooms r ON r.id=s.room_id WHERE s.exam_id=? ORDER BY r.room_name, s.bench_no, s.seat_no");
     $st->execute([$selectedExam]);
     $seatRows = $st->fetchAll();
 }
+
+// Group seating by room and split into 3 rows (Row 1, Row 2, Row 3)
 $byRoom = [];
-foreach ($seatRows as $row) $byRoom[$row['room_name']][$row['bench_no']][] = $row;
+$roomDesksMap = [];
+foreach ($rooms as $r) {
+    $usable = min((int)$r['desk_count'], (int)ceil(min(30, (int)$r['desk_count'] * 2) / 2));
+    $roomDesksMap[$r['room_name']] = max(1, $usable);
+}
+foreach ($seatRows as $row) {
+    $byRoom[$row['room_name']][$row['bench_no']][] = $row;
+}
 $msg = $_GET['msg'] ?? ''; $type = $_GET['type'] ?? 'success';
 ?>
 <!doctype html>
@@ -440,21 +442,25 @@ input[type="file"]{padding:7px;background:#f8fafc}
 button,.btn{display:inline-block;border:0;background:var(--blue);color:white;padding:10px 15px;border-radius:7px;cursor:pointer;text-decoration:none;font-size:14px;margin-top:12px}
 button.danger{background:#b42318}button.secondary{background:#475569}.muted{color:#64748b;font-size:13px}.alert{padding:12px;border-radius:8px;margin-bottom:16px;background:#e8f5e9;color:#176b2c}.alert.error{background:#fdecec;color:#a11b1b}
 table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:9px;border-bottom:1px solid var(--line);text-align:left}th{background:#f8fafc}
-.inline{display:inline}.inline button{margin:0;padding:6px 9px}.room{margin:18px 0}.benches{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
-.bench{border:1px solid var(--line);border-radius:8px;padding:10px;background:#fbfdff}.bench strong{display:block;margin-bottom:7px}
-.seat{font-size:13px;padding:7px;margin:4px 0;background:#eaf1fb;border-radius:5px;line-height:1.35}
+.inline{display:inline}.inline button{margin:0;padding:6px 9px}.room{margin:22px 0;padding-bottom:12px;border-bottom:2px solid #e2e8f0}
+.three-rows{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.row-col{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:10px}
+.row-col h4{margin:0 0 10px;padding:6px 10px;background:#173d75;color:#fff;border-radius:6px;font-size:14px;text-align:center}
+.bench{border:1px solid var(--line);border-radius:8px;padding:9px;background:#ffffff;margin-bottom:10px}
+.bench strong{display:block;margin-bottom:6px;font-size:13px;color:#1e293b}
+.seat{font-size:13px;padding:6px 8px;margin:4px 0;background:#eaf1fb;border-radius:5px;line-height:1.35}
 .seat .reg{font-weight:bold;color:#0f294a}.seat .sname{color:#334155;font-size:12px}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.actions button{margin-top:0}
 details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-size:13px;font-weight:bold}
 .stu-list{max-height:180px;overflow-y:auto;border:1px solid var(--line);border-radius:6px;margin-top:6px;padding:6px;background:#f8fafc;font-size:12px}
-.print-only{display:none}
+@media (max-width:850px){.three-rows{grid-template-columns:1fr}}
 @media print{
   header,.no-print,.card.forms{display:none!important}
-  .print-only{display:block!important}
   body{background:white}
   main{max-width:none;margin:0;padding:0}
   .card{box-shadow:none;border:0;padding:0}
-  .room{page-break-inside:avoid}
+  .room{page-break-inside:avoid;border-bottom:0}
+  .three-rows{grid-template-columns:repeat(3,1fr)!important;gap:10px}
   .bench{border:1px solid #888}
 }
 </style>
@@ -542,7 +548,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 
 <section class="card no-print">
 <h2>6. Generate Seating Arrangement</h2>
-<p class="muted">Generation replaces the previous arrangement for the selected examination. Each bench will contain no more than two students, and their subject codes will be different.</p>
+<p class="muted">Generation fills each room in 3 rows sequentially: Row 1 (first bench to last bench, 2 different subjects per bench), then Row 2, then Row 3.</p>
 <form method="post" onsubmit="return confirm('Generate or replace the seating arrangement for this examination?')">
 <input type="hidden" name="action" value="generate"><input type="hidden" name="exam_id" value="<?=h($selectedExam)?>">
 <button type="submit" <?=(!$subjects || !$rooms)?'disabled':''?>>Generate Seating Arrangement</button>
@@ -552,38 +558,66 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 <?php if($seatRows): ?>
 <section class="card">
 <div class="actions no-print" style="justify-content:space-between;align-items:center">
-  <h2>Generated Seating Chart</h2>
+  <h2>Generated Seating Chart (3-Row Layout)</h2>
   <button onclick="window.print()">Print Seating Chart</button>
 </div>
 <p><strong><?=h($selected['exam_name'] ?? '')?> — <?=h($selected['exam_date'] ?? '')?></strong></p>
 
-<?php foreach($byRoom as $roomName=>$benches): ?>
+<?php foreach($byRoom as $roomName => $benches):
+    $totalRoomBenches = max($roomDesksMap[$roomName] ?? 1, max(array_keys($benches)));
+    $perRow = max(1, (int)ceil($totalRoomBenches / 3));
+?>
 <div class="room">
   <h3><?=h($roomName)?></h3>
-  <div class="benches">
-  <?php foreach($benches as $benchNo=>$seats): ?>
-    <div class="bench">
-      <strong>Bench <?=h($benchNo)?></strong>
-      <?php foreach($seats as $seat): ?>
-        <div class="seat">
-          Seat <?=h($seat['seat_no'])?>: <b><?=h($seat['subject_code'])?></b><br>
-          <span class="reg"><?=h($seat['register_no'])?></span><br>
-          <span class="sname"><?=h($seat['student_name'])?></span>
+  <div class="three-rows">
+    <?php for ($rowNum = 1; $rowNum <= 3; $rowNum++):
+        $startBench = ($rowNum - 1) * $perRow + 1;
+        $endBench   = min($totalRoomBenches, $rowNum * $perRow);
+    ?>
+    <div class="row-col">
+      <h4>Row <?= $rowNum ?></h4>
+      <?php
+      $hasBenchesInRow = false;
+      for ($bNo = $startBench; $bNo <= $endBench; $bNo++):
+          if (!isset($benches[$bNo])) continue;
+          $hasBenchesInRow = true;
+          $rowBenchIndex = $bNo - $startBench + 1;
+      ?>
+        <div class="bench">
+          <strong>Row <?= $rowNum ?> — Bench <?= $rowBenchIndex ?> <span class="muted">(Desk #<?= $bNo ?>)</span></strong>
+          <?php foreach($benches[$bNo] as $seat): ?>
+            <div class="seat">
+              Seat <?=h($seat['seat_no'])?>: <b><?=h($seat['subject_code'])?></b><br>
+              <span class="reg"><?=h($seat['register_no'])?></span><br>
+              <span class="sname"><?=h($seat['student_name'])?></span>
+            </div>
+          <?php endforeach; ?>
         </div>
-      <?php endforeach; ?>
+      <?php endfor; ?>
+      <?php if (!$hasBenchesInRow): ?>
+        <p class="muted" style="text-align:center">Empty</p>
+      <?php endif; ?>
     </div>
-  <?php endforeach; ?>
+    <?php endfor; ?>
   </div>
 </div>
 <?php endforeach; ?>
 
 <h3>Room-wise Student Register Summary</h3>
 <table>
-  <tr><th>Room</th><th>Bench</th><th>Seat</th><th>Subject Code</th><th>Register Number</th><th>Student Name</th></tr>
-  <?php foreach($seatRows as $sr): ?>
+  <tr><th>Room</th><th>Row</th><th>Row Bench</th><th>Seat</th><th>Subject Code</th><th>Register Number</th><th>Student Name</th></tr>
+  <?php foreach($seatRows as $sr):
+      $rName = $sr['room_name'];
+      $totB  = $roomDesksMap[$rName] ?? 15;
+      $pRow  = max(1, (int)ceil($totB / 3));
+      $bNo   = (int)$sr['bench_no'];
+      $rNum  = (int)ceil($bNo / $pRow);
+      $rbNo  = $bNo - ($rNum - 1) * $pRow;
+  ?>
   <tr>
-    <td><?=h($sr['room_name'])?></td>
-    <td><?=h($sr['bench_no'])?></td>
+    <td><?=h($rName)?></td>
+    <td>Row <?=$rNum?></td>
+    <td>Bench <?=$rbNo?></td>
     <td><?=h($sr['seat_no'])?></td>
     <td><b><?=h($sr['subject_code'])?></b></td>
     <td><b><?=h($sr['register_no'])?></b></td>
