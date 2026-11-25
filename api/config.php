@@ -1,6 +1,6 @@
 <?php
 $host = 'gateway01.ap-southeast-1.prod.aws.tidbcloud.com';//localhost
-$db   = 'sys';//exam_seating
+$db   = 'exam_seating';//exam_seating
 $user = 'LJ4JbKGYLujwpXW.root';//root
 $pass = '1NIctAJh7FDcyyBI'; // Default XAMPP MySQL password is blank. Change if you set one.
 $charset = 'utf8mb4';
