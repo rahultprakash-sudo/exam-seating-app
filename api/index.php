@@ -11,23 +11,26 @@ function go($msg, $type = 'success', $examId = 0) {
 }
 
 /**
- * Parse a register number such as IGW23AIM001 or LIGW23AIM0015 into structured parts:
+ * Parse a register number such as IGW23AIM001 or LIGW23AIM029 into structured parts:
  * - year: Admission year (e.g., 21, 22, 23, 25, 26)
  * - dept: Department code (e.g., AIM, ALM, BBA, BCA, CE, CS, EEE)
  * - is_lateral: 0 for regular (IGW), 1 for lateral entry (LIGW)
  * - roll: Numeric roll number
+ * - cohort: Combined Year + Department key (e.g., "0023_AIM") so IGW and LIGW stay bound together
  */
 function parseRegisterNo(string $regNo): array {
     $clean = strtoupper(trim($regNo));
-    // Matches optional leading 'L' (Lateral Entry), college code (e.g. IGW), 2-digit year, letters for dept, and trailing digits
     if (preg_match('/^(L?)([A-Z]+)(\d{2})([A-Z]+)(\d+)$/', $clean, $m)) {
+        $year = (int)$m[3];
+        $dept = $m[4];
         return [
             'matched'    => true,
             'is_lateral' => ($m[1] === 'L') ? 1 : 0,
             'college'    => $m[2],
-            'year'       => (int)$m[3],
-            'dept'       => $m[4],
+            'year'       => $year,
+            'dept'       => $dept,
             'roll'       => (int)$m[5],
+            'cohort'     => sprintf('%04d_%s', $year, $dept),
             'raw'        => $clean,
         ];
     }
@@ -38,6 +41,7 @@ function parseRegisterNo(string $regNo): array {
         'year'       => PHP_INT_MAX,
         'dept'       => $clean,
         'roll'       => PHP_INT_MAX,
+        'cohort'     => '9999_' . $clean,
         'raw'        => $clean,
     ];
 }
@@ -46,8 +50,8 @@ function parseRegisterNo(string $regNo): array {
  * Sort comparator:
  * 1. Year ascending (21, 22, 23, 25, 26...)
  * 2. Department ascending (AIM, BBA, BCA, CE, CS, EEE...)
- * 3. Regular (IGW = 0) before Lateral Entry (LIGW = 1) within the SAME year & department
- * 4. Roll number ascending (1, 2, 3, ..., 15, 16...)
+ * 3. Regular (IGW = 0) first, followed IMMEDIATELY by Lateral Entry (LIGW = 1) of the SAME year & department
+ * 4. Roll number ascending (1, 2, 3, ..., 29...)
  */
 function compareRegisterNumbers(string $regA, string $regB): int {
     $a = parseRegisterNo($regA);
@@ -234,9 +238,9 @@ if (isset($_GET['download_sample'])) {
     echo "register_no,student_name\n";
     echo "IGW23AIM001,Student One\n";
     echo "IGW23AIM002,Student Two\n";
-    echo "LIGW23AIM015,Lateral Student One\n";
-    echo "LIGW23AIM016,Lateral Student Two\n";
-    echo "IGW23CS001,CS Student One\n";
+    echo "IGW23AIM003,Student Three\n";
+    echo "LIGW23AIM029,Lateral Student One\n";
+    echo "IGW23EEE001,EEE Student One\n";
     exit;
 }
 
@@ -280,7 +284,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->rollBack();
             go('This subject code is already added for the selected examination, or the file data is invalid.', 'error', $examId);
         }
-        go("Subject $code added successfully with $count students (sorted by Year, Department, IGW then LIGW).", 'success', $examId);
+        go("Subject $code added successfully with $count students (IGW followed by LIGW per Year & Dept).", 'success', $examId);
     }
 
     if ($action === 'delete_subject') {
@@ -320,7 +324,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!$examId || !$subjects || !$rooms) go('Add at least one subject and one room before generating.', 'error', $examId);
 
-        // Load student queues strictly sorted by Year -> Department -> Regular (IGW) then Lateral (LIGW) -> Roll Number
+        // Load student queues strictly sorted by:
+        // Year -> Department -> Regular (IGW) then Lateral (LIGW) -> Roll Number
         $studentQueues = [];
         $stuStmt = $pdo->prepare("SELECT student_no, register_no, student_name FROM subject_students WHERE subject_id = ? ORDER BY student_no ASC");
         foreach ($subjects as $s) {
@@ -330,6 +335,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 go("Student list count mismatch for {$s['subject_code']}. Re-upload the subject student file.", 'error', $examId);
             }
             usort($list, fn($a, $b) => compareRegisterNumbers($a['register_no'], $b['register_no']));
+            foreach ($list as &$item) {
+                $parsed = parseRegisterNo($item['register_no']);
+                $item['cohort']     = $parsed['cohort'];
+                $item['is_lateral'] = $parsed['is_lateral'];
+            }
+            unset($item);
             $studentQueues[$s['subject_code']] = $list;
         }
 
@@ -354,7 +365,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             go("Insufficient room capacity. Students: $totalStudents; available capacity: $totalCapacity.", 'error', $examId);
         }
 
-        // Fill Room 1 completely (Row 1 -> Row 2 -> Row 3) sequentially, then move to Room 2, etc.
+        // Fill Room 1 completely (Row 1 -> Row 2 -> Row 3) sequentially before moving to Room 2.
+        // Within every subject stream, IGW students of a Year+Dept are immediately followed by LIGW students
+        // of that SAME Year+Dept, so LIGW stays in the same room whenever seats remain vacant!
         $remaining = [];
         foreach ($subjects as $s) $remaining[$s['subject_code']] = (int)$s['student_count'];
         $studentIndices = array_fill_keys(array_keys($remaining), 0);
@@ -368,39 +381,78 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($placed >= $totalStudents || $roomOccupied >= $room['capacity']) break;
 
                 $bench = [];
-                // Seat 1 on this bench: subject with highest remaining count
-                arsort($remaining);
-                $sub1 = null;
-                foreach ($remaining as $cand => $left) {
-                    if ($left > 0) { $sub1 = $cand; break; }
-                }
+
+                // Helper to pick best subject candidate:
+                // Prioritizes any subject whose next student is a Lateral Entry (LIGW) matching the
+                // cohort already started in this room, then falls back to highest remaining count.
+                $pickSubject = function (?string $excludeSub) use (&$remaining, &$studentQueues, &$studentIndices, &$room): ?string {
+                    $activeCohortsInRoom = [];
+                    foreach ($room['benches'] as $existingBench) {
+                        foreach ($existingBench as $existingSeat) {
+                            $activeCohortsInRoom[$existingSeat['cohort']] = true;
+                        }
+                    }
+
+                    $bestSub = null;
+                    $bestScore = null;
+                    foreach ($remaining as $cand => $left) {
+                        if ($left <= 0 || $cand === $excludeSub) continue;
+                        $nextStu = $studentQueues[$cand][$studentIndices[$cand]];
+                        $isSameCohortLigw = ($nextStu['is_lateral'] === 1 && isset($activeCohortsInRoom[$nextStu['cohort']])) ? 1 : 0;
+
+                        // Priority tuple:
+                        // 1. Keep LIGW in same room as its IGW Year+Dept cohort
+                        // 2. Earliest Year+Dept cohort first (e.g., 21_CS before 22_CS before 23_AIM)
+                        // 3. Highest remaining student count for balanced bench pairing
+                        $score = [
+                            $isSameCohortLigw,
+                            $nextStu['cohort'],
+                            $left
+                        ];
+
+                        if ($bestScore === null) {
+                            $bestSub = $cand;
+                            $bestScore = $score;
+                        } else {
+                            if ($score[0] !== $bestScore[0]) {
+                                if ($score[0] > $bestScore[0]) { $bestSub = $cand; $bestScore = $score; }
+                            } elseif ($score[1] !== $bestScore[1]) {
+                                if (strcmp($score[1], $bestScore[1]) < 0) { $bestSub = $cand; $bestScore = $score; }
+                            } elseif ($score[2] > $bestScore[2]) {
+                                $bestSub = $cand; $bestScore = $score;
+                            }
+                        }
+                    }
+                    return $bestSub;
+                };
+
+                // Seat 1 on this bench
+                $sub1 = $pickSubject(null);
                 if ($sub1 !== null) {
                     $stuObj = $studentQueues[$sub1][$studentIndices[$sub1]++];
                     $bench[] = [
                         'subject' => $sub1,
                         'student_no' => $stuObj['student_no'],
                         'register_no' => $stuObj['register_no'],
-                        'student_name' => $stuObj['student_name']
+                        'student_name' => $stuObj['student_name'],
+                        'cohort' => $stuObj['cohort']
                     ];
                     $remaining[$sub1]--;
                     $placed++;
                     $roomOccupied++;
                 }
 
-                // Seat 2 on the SAME bench: DIFFERENT subject with highest remaining count
+                // Seat 2 on the SAME bench: DIFFERENT subject
                 if ($placed < $totalStudents && $roomOccupied < $room['capacity'] && $sub1 !== null) {
-                    arsort($remaining);
-                    $sub2 = null;
-                    foreach ($remaining as $cand => $left) {
-                        if ($left > 0 && $cand !== $sub1) { $sub2 = $cand; break; }
-                    }
+                    $sub2 = $pickSubject($sub1);
                     if ($sub2 !== null) {
                         $stuObj = $studentQueues[$sub2][$studentIndices[$sub2]++];
                         $bench[] = [
                             'subject' => $sub2,
                             'student_no' => $stuObj['student_no'],
                             'register_no' => $stuObj['register_no'],
-                            'student_name' => $stuObj['student_name']
+                            'student_name' => $stuObj['student_name'],
+                            'cohort' => $stuObj['cohort']
                         ];
                         $remaining[$sub2]--;
                         $placed++;
@@ -446,7 +498,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->rollBack();
             go('Could not save seating arrangement: ' . $e->getMessage(), 'error', $examId);
         }
-        go("Seating arrangement generated successfully for $placed students (Year → Department → IGW then LIGW).", 'success', $examId);
+        go("Seating arrangement generated successfully for $placed students (IGW followed immediately by same Year & Dept LIGW).", 'success', $examId);
     }
 }
 
@@ -631,7 +683,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 
 <section class="card no-print">
 <h2>6. Generate Seating Arrangement</h2>
-<p class="muted">Fills Room 1 (Row 1 → Row 2 → Row 3) sequentially in Year → Department → Regular (IGW) then Lateral (LIGW) → Ascending Roll order, then moves to the next room.</p>
+<p class="muted">Fills Room 1 (Row 1 → Row 2 → Row 3) sequentially in Year → Department → Regular (IGW) followed immediately by Lateral (LIGW) → Ascending Roll order, keeping LIGW in the same room whenever seats remain vacant after IGW.</p>
 <form method="post" onsubmit="return confirm('Generate or replace the seating arrangement for this examination?')">
 <input type="hidden" name="action" value="generate"><input type="hidden" name="exam_id" value="<?=h($selectedExam)?>">
 <button type="submit" <?=(!$subjects || !$rooms)?'disabled':''?>>Generate Seating Arrangement</button>
