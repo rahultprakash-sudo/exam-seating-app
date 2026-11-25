@@ -1,4 +1,5 @@
 <?php
+error_reporting(E_ALL & ~E_DEPRECATED);
 require __DIR__ . '/config.php';
 
 function h($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
@@ -26,14 +27,11 @@ function parseStudentFile(array $file): array {
         $raw = file_get_contents($file['tmp_name']);
         if ($raw === false) throw new RuntimeException('Unable to read uploaded CSV file.');
         // Strip UTF-8 BOM if present
-        $raw = preg_replace('/^ï»¿/', '', $raw);
-        $lines = preg_split('/
-|
-|
-/', $raw);
+        $raw = preg_replace('/^\xEF\xBB\xBF/', '', $raw);
+        $lines = preg_split('/\r\n|\r|\n/', $raw);
         foreach ($lines as $line) {
             if (trim($line) === '') continue;
-            $rows[] = str_getcsv($line);
+            $rows[] = str_getcsv($line, ',', '"', '\\');
         }
     } elseif ($ext === 'xlsx') {
         if (!class_exists('ZipArchive')) {
@@ -175,16 +173,11 @@ function parseStudentFile(array $file): array {
 if (isset($_GET['download_sample'])) {
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="sample_students.csv"');
-    echo "register_no,student_name
-";
-    echo "REG2026001,Arjun Menon
-";
-    echo "REG2026002,Meera Nair
-";
-    echo "REG2026003,Rahul Krishnan
-";
-    echo "REG2026004,Sneha Varma
-";
+    echo "register_no,student_name\n";
+    echo "REG2026001,Arjun Menon\n";
+    echo "REG2026002,Meera Nair\n";
+    echo "REG2026003,Rahul Krishnan\n";
+    echo "REG2026004,Sneha Varma\n";
     exit;
 }
 
