@@ -382,9 +382,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 $bench = [];
 
-                // Helper to pick best subject candidate:
-                // Prioritizes any subject whose next student is a Lateral Entry (LIGW) matching the
-                // cohort already started in this room, then falls back to highest remaining count.
                 $pickSubject = function (?string $excludeSub) use (&$remaining, &$studentQueues, &$studentIndices, &$room): ?string {
                     $activeCohortsInRoom = [];
                     foreach ($room['benches'] as $existingBench) {
@@ -400,10 +397,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $nextStu = $studentQueues[$cand][$studentIndices[$cand]];
                         $isSameCohortLigw = ($nextStu['is_lateral'] === 1 && isset($activeCohortsInRoom[$nextStu['cohort']])) ? 1 : 0;
 
-                        // Priority tuple:
-                        // 1. Keep LIGW in same room as its IGW Year+Dept cohort
-                        // 2. Earliest Year+Dept cohort first (e.g., 21_CS before 22_CS before 23_AIM)
-                        // 3. Highest remaining student count for balanced bench pairing
                         $score = [
                             $isSameCohortLigw,
                             $nextStu['cohort'],
@@ -498,7 +491,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->rollBack();
             go('Could not save seating arrangement: ' . $e->getMessage(), 'error', $examId);
         }
-        go("Seating arrangement generated successfully for $placed students (IGW followed immediately by same Year & Dept LIGW).", 'success', $examId);
+        // go("Seating arrangement generated successfully for $placed students (IGW followed immediately by same Year & Dept LIGW).", 'success', $examId);
     }
 }
 
@@ -586,17 +579,42 @@ table{width:100%;border-collapse:collapse;font-size:14px;margin-bottom:14px}th,t
 details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-size:13px;font-weight:bold}
 .stu-list{max-height:180px;overflow-y:auto;border:1px solid var(--line);border-radius:6px;margin-top:6px;padding:6px;background:#f8fafc;font-size:12px}
 .sub-badge{display:inline-block;background:#173d75;color:#fff;padding:3px 9px;border-radius:5px;font-size:13px;margin:10px 0 6px}
+.print-only-header{display:none}
 @media (max-width:850px){.three-rows{grid-template-columns:1fr}}
 @media print{
-  header,.no-print,.card.forms{display:none!important}
-  body{background:white}
+  @page{size:A4 portrait;margin:10mm}
+  header,.no-print,.card.forms,.screen-only{display:none!important}
+  body{background:white;-webkit-print-color-adjust:exact;print-color-adjust:exact}
   main{max-width:none;margin:0;padding:0}
-  .card{box-shadow:none;border:0;padding:0}
-  .room,.room-print-block{page-break-inside:avoid;border-bottom:0;margin-bottom:18px}
-  .three-rows{grid-template-columns:repeat(3,1fr)!important;gap:10px}
-  .bench{border:1px solid #888}
-  table{font-size:12px}
-  th,td{padding:6px 8px;border:1px solid #888}
+  .card{box-shadow:none;border:0;padding:0;margin:0}
+  .print-only-header{display:block;border-bottom:2px solid #173d75;padding-bottom:6px;margin-bottom:10px}
+  .print-only-header h2{margin:0 0 2px;font-size:16px;color:#173d75}
+  .print-only-header p{margin:0;font-size:12px;color:#334155}
+  /* Force each room (both bench chart and room-wise register list) onto its own single page */
+  .room,.room-print-block{
+    page-break-inside:avoid;
+    break-inside:avoid;
+    page-break-after:always;
+    break-after:page;
+    border-bottom:0;
+    margin:0;
+    padding:0;
+  }
+  .room-print-block:last-of-type{
+    page-break-after:auto;
+    break-after:auto;
+  }
+  .room h3,.room-print-block h3{margin:0 0 8px;font-size:15px}
+  .three-rows{grid-template-columns:repeat(3,1fr)!important;gap:8px}
+  .row-col{padding:6px;border-radius:6px}
+  .row-col h4{margin:0 0 6px;padding:4px 6px;font-size:12px}
+  .bench{border:1px solid #888;padding:6px;margin-bottom:6px;border-radius:5px}
+  .bench strong{font-size:11px;margin-bottom:4px}
+  .seat{font-size:11px;padding:4px 6px;margin:3px 0;line-height:1.25}
+  .seat .sname{font-size:10px}
+  .sub-badge{margin:6px 0 4px;padding:2px 7px;font-size:11px}
+  table{font-size:11px;margin-bottom:8px}
+  th,td{padding:4px 6px;border:1px solid #888}
 }
 </style>
 </head>
@@ -696,14 +714,18 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
   <h2>Generated Seating Chart (3-Row Layout)</h2>
   <button onclick="window.print()">Print Seating Chart</button>
 </div>
-<p><strong><?=h($selected['exam_name'] ?? '')?> — <?=h($selected['exam_date'] ?? '')?></strong></p>
+<p class="screen-only"><strong><?=h($selected['exam_name'] ?? '')?> — <?=h($selected['exam_date'] ?? '')?></strong></p>
 
 <?php foreach($byRoom as $roomName => $benches):
     $totalRoomBenches = max($roomDesksMap[$roomName] ?? 1, max(array_keys($benches)));
     $perRow = max(1, (int)ceil($totalRoomBenches / 3));
 ?>
 <div class="room">
-  <h3><?=h($roomName)?> — 3-Row Bench Chart</h3>
+  <div class="print-only-header">
+    <h2>Indira Gandhi Institute of Engineering and Technology</h2>
+    <p><strong><?=h($selected['exam_name'] ?? '')?></strong> | Date: <strong><?=h($selected['exam_date'] ?? '')?></strong> | Room: <strong><?=h($roomName)?></strong> (Bench Layout)</p>
+  </div>
+  <h3>Room No : <?=h($roomName)?> </h3>
   <div class="three-rows">
     <?php for ($rowNum = 1; $rowNum <= 3; $rowNum++):
         $startBench = ($rowNum - 1) * $perRow + 1;
@@ -738,12 +760,16 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 </div>
 <?php endforeach; ?>
 
-<h2 style="margin-top:24px">Room-wise & Subject-wise Register List (Year → Dept → IGW + LIGW)</h2>
+<h2 class="screen-only" style="margin-top:24px">Room-wise & Subject-wise Register List (Year → Dept → IGW + LIGW)</h2>
 <?php foreach($byRoomSubject as $roomName => $subGroups):
     $totB = $roomDesksMap[$roomName] ?? 15;
     $pRow = max(1, (int)ceil($totB / 3));
 ?>
 <div class="room-print-block">
+  <div class="print-only-header">
+    <h2>Indira Gandhi Institute of Engineering and Technology</h2>
+    <p><strong><?=h($selected['exam_name'] ?? '')?></strong> | Date: <strong><?=h($selected['exam_date'] ?? '')?></strong> | Room: <strong><?=h($roomName)?></strong> (Register List)</p>
+  </div>
   <h3><?=h($roomName)?></h3>
   <?php foreach($subGroups as $subCode => $stuRows):
       $firstReg = $stuRows[0]['register_no'] ?? '';
@@ -779,9 +805,11 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 </div>
 <?php endforeach; ?>
 
+<div class="no-print">
 <h3 style="margin-top:20px">Subject-wise Total Allocation</h3>
 <table><tr><th>Subject</th><th>Allocated</th></tr>
 <?php foreach($subjects as $s): $count=0; foreach($seatRows as $sr) if($sr['subject_code']===$s['subject_code']) $count++; ?><tr><td><?=h($s['subject_code'])?></td><td><?=$count?> / <?=h($s['student_count'])?></td></tr><?php endforeach; ?></table>
+</div>
 </section>
 <?php endif; ?>
 <p class="muted no-print">Upload a .csv or .xlsx student list for each subject code to assign seats with actual Register Numbers and Student Names.</p>
