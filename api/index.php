@@ -10,6 +10,35 @@ function go($msg, $type = 'success', $examId = 0) {
     exit;
 }
 
+function isSeminarHall(string $roomName): bool {
+    return stripos($roomName, 'seminar') !== false;
+}
+
+function getRoomMetrics(string $roomName, int $count): array {
+    if (isSeminarHall($roomName)) {
+        // Seminar Hall: count is number of individual chairs (1 student per chair, no 34-seat cap)
+        $chairs = max(1, $count);
+        return [
+            'is_seminar'     => true,
+            'unit_label'     => 'Chairs',
+            'seats_per_unit' => 1,
+            'usable_benches' => $chairs,
+            'capacity'       => $chairs,
+        ];
+    }
+    // Standard Classroom: count is number of desks (2 seats per desk, capped at 34 seats / 17 desks)
+    $desks = max(1, $count);
+    $cap = min(34, $desks * 2);
+    $usableBenches = min($desks, (int)ceil($cap / 2));
+    return [
+        'is_seminar'     => false,
+        'unit_label'     => 'Desks',
+        'seats_per_unit' => 2,
+        'usable_benches' => $usableBenches,
+        'capacity'       => $cap,
+    ];
+}
+
 /**
  * Parse a register number such as IGW23AIM001 or LIGW23AIM029 into structured parts:
  * - year: Admission year (e.g., 21, 22, 23, 25, 26)
@@ -297,15 +326,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'add_room') {
         $examId = (int)($_POST['exam_id'] ?? 0);
         $name = trim($_POST['room_name'] ?? '');
+        $roomType = $_POST['room_type'] ?? 'classroom';
         $desks = (int)($_POST['desk_count'] ?? 0);
-        if (!$name || $desks < 1) go('Enter a room name and a positive desk count.', 'error', $examId);
+        if ($roomType === 'seminar' && stripos($name, 'seminar') === false) {
+            $name = $name !== '' ? ($name . ' (Seminar Hall)') : 'Seminar Hall';
+        }
+        if (!$name || $desks < 1) {
+            $unitWord = isSeminarHall($name) ? 'chair' : 'desk';
+            go("Enter a room name and a positive $unitWord count.", 'error', $examId);
+        }
         try {
             $stmt = $pdo->prepare("INSERT INTO rooms (room_name, desk_count) VALUES (?, ?)");
             $stmt->execute([$name, $desks]);
         } catch (PDOException $e) {
             go('Room name already exists, or the data is invalid.', 'error', $examId);
         }
-        go('Room added successfully.', 'success', $examId);
+        $msgAdded = isSeminarHall($name)
+            ? "Seminar Hall added with $desks individual chairs (1 student per chair)."
+            : "Room added successfully ($desks desks, capacity " . min(34, $desks * 2) . ").";
+        go($msgAdded, 'success', $examId);
     }
 
     if ($action === 'delete_room') {
@@ -348,14 +387,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $roomState = [];
         foreach ($rooms as $r) {
             $desks = (int)$r['desk_count'];
-            $cap = min(34, $desks * 2);
-            $usableBenches = min($desks, (int)ceil($cap / 2));
+            $metrics = getRoomMetrics($r['room_name'], $desks);
             $roomState[$r['id']] = [
                 'id' => (int)$r['id'],
                 'name' => $r['room_name'],
+                'is_seminar' => $metrics['is_seminar'],
+                'seats_per_unit' => $metrics['seats_per_unit'],
                 'desks' => $desks,
-                'usable_benches' => $usableBenches,
-                'capacity' => $cap,
+                'usable_benches' => $metrics['usable_benches'],
+                'capacity' => $metrics['capacity'],
                 'benches' => []
             ];
         }
@@ -366,30 +406,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             go("Insufficient room capacity. Students: $totalStudents; available capacity: $totalCapacity.", 'error', $examId);
         }
 
-        // Check whether the largest subject exceeds the sum of all other subjects.
-        // Even when one subject has a huge count, each bench can hold at most 1 student of that subject
-        // so same-subject students NEVER sit together on the same bench ("same bunch").
+        // Maximum students of a single subject that can sit without same-subject neighbors:
+        // - Classroom: at most 1 student per desk (usable_benches)
+        // - Seminar Hall (1 chair = 1 seat): at most ceil(chairs / 2) so adjacent chairs never share the same subject
+        $maxNonAdjacentSlots = 0;
+        foreach ($roomState as $rs) {
+            $maxNonAdjacentSlots += $rs['is_seminar']
+                ? (int)ceil($rs['usable_benches'] / 2)
+                : $rs['usable_benches'];
+        }
         $totalUsableBenches = array_sum(array_column($roomState, 'usable_benches'));
         $maxSubjectCount = max(array_column($subjects, 'student_count'));
-        if ($maxSubjectCount > $totalUsableBenches) {
-            go("Cannot separate same-subject students onto different benches: the largest subject has $maxSubjectCount students, " .
-               "which exceeds the total available benches ($totalUsableBenches) across all rooms. Add more rooms/desks.", 'error', $examId);
+        if ($maxSubjectCount > $maxNonAdjacentSlots) {
+            go("Cannot separate same-subject students without adjacent bunching: the largest subject has $maxSubjectCount students, " .
+               "which exceeds the maximum non-adjacent seats ($maxNonAdjacentSlots) across all rooms/chairs. Add more rooms or chairs.", 'error', $examId);
         }
 
         // Fill rooms strictly in Room Number order (Room 1 -> Room 2 -> ...) and Row 1 -> Row 2 -> Row 3.
-        // To prevent a high-count subject from clustering ("bunching") in later rooms or on the same bench:
-        // 1. Each bench strictly enforces Seat 1 subject != Seat 2 subject (at most 1 student per subject per bench).
-        // 2. When a dominant subject has more remaining students than all other subjects combined,
-        //    we spread the other subjects evenly across rooms/benches or place 1 student per bench so
-        //    same-subject students are never paired together.
-        // 3. Within every subject stream, IGW students of a Year+Dept are immediately followed by LIGW students
-        //    of that SAME Year+Dept.
+        // - In Classrooms: 2 seats per desk, Seat 1 != Seat 2 subject.
+        // - In Seminar Hall: 1 seat per chair, Chair N != Chair (N-1) subject.
         $remaining = [];
         foreach ($subjects as $s) $remaining[$s['subject_code']] = (int)$s['student_count'];
         $studentIndices = array_fill_keys(array_keys($remaining), 0);
         $placed = 0;
-
-        // Calculate how many benches remain across all rooms from a given point
         $benchesRemainingTotal = $totalUsableBenches;
 
         foreach ($roomState as $rid => &$room) {
@@ -413,8 +452,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
 
-                    // Check if any subject is critically close to needing 1 seat on every remaining bench
-                    $totalRem = array_sum($remaining);
                     $bestSub = null;
                     $bestScore = null;
 
@@ -422,17 +459,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if ($left <= 0 || $cand === $excludeSub) continue;
                         $nextStu = $studentQueues[$cand][$studentIndices[$cand]];
 
-                        // Priority 1: Must-place if remaining count of this subject >= remaining benches
-                        // (guarantees this subject never overflows and never gets bunched on a single bench)
                         $mustPlaceNow = ($left >= $benchesRemainingTotal) ? 1 : 0;
-
-                        // Priority 2: Keep LIGW right after IGW of the same Year+Dept in the same room
                         $isSameCohortLigw = ($nextStu['is_lateral'] === 1 && isset($activeCohortsInRoom[$nextStu['cohort']])) ? 1 : 0;
-
-                        // Priority 3: Avoid repeating the exact same subject in Seat 1 of adjacent benches when alternatives exist
                         $diffFromPrevBench = ($avoidSameSlotSub !== null && $cand !== $avoidSameSlotSub) ? 1 : 0;
 
-                        // Priority 4: Prefer subject with higher remaining share so large subjects are distributed steadily across rooms
                         $score = [
                             $mustPlaceNow,
                             $isSameCohortLigw,
@@ -462,8 +492,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     return $bestSub;
                 };
 
-                // Seat 1 on this bench
-                $sub1 = $pickSubject(null, $prevBenchSub1);
+                // Seat 1 on this bench / Chair
+                // In Seminar Hall, strictly avoid the previous chair's subject ($prevBenchSub1) unless no other subject exists
+                $sub1 = $room['is_seminar']
+                    ? ($pickSubject($prevBenchSub1, null) ?? $pickSubject(null, null))
+                    : $pickSubject(null, $prevBenchSub1);
+
                 if ($sub1 !== null) {
                     $stuObj = $studentQueues[$sub1][$studentIndices[$sub1]++];
                     $bench[] = [
@@ -478,10 +512,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $roomOccupied++;
                 }
 
-                // Seat 2 on the SAME bench: strictly a DIFFERENT subject code
-                // If only the same subject code remains, leave Seat 2 vacant on this bench and move to the next bench/room
-                // so same-subject students NEVER sit together in the same bunch.
-                if ($placed < $totalStudents && $roomOccupied < $room['capacity'] && $sub1 !== null) {
+                // Seat 2 on the SAME bench (only for 2-seater desks; Seminar Hall has 1 student per chair)
+                if (!$room['is_seminar'] && $placed < $totalStudents && $roomOccupied < $room['capacity'] && $sub1 !== null) {
                     $sub2 = $pickSubject($sub1, null);
                     if ($sub2 !== null) {
                         $stuObj = $studentQueues[$sub2][$studentIndices[$sub2]++];
@@ -507,8 +539,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         unset($room);
 
         if ($placed < $totalStudents) {
-            go("Could not seat all students in room order without placing the same subject together on a bench. " .
-               "Placed $placed of $totalStudents. Add more rooms/desks so each bench has at most 1 student per subject.", 'error', $examId);
+            go("Could not seat all students in room order without placing the same subject together. " .
+               "Placed $placed of $totalStudents. Add more rooms/chairs so same-subject students stay separated.", 'error', $examId);
         }
 
         $pdo->beginTransaction();
@@ -537,7 +569,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->rollBack();
             go('Could not save seating arrangement: ' . $e->getMessage(), 'error', $examId);
         }
-        go("Seating arrangement generated successfully for $placed students across rooms in room order without grouping same-subject students together.", 'success', $examId);
+        go("Seating arrangement generated successfully for $placed students across rooms/chairs without grouping same-subject students together.", 'success', $examId);
     }
 }
 
@@ -576,8 +608,8 @@ $byRoom = [];
 $byRoomSubject = [];
 $roomDesksMap = [];
 foreach ($rooms as $r) {
-    $usable = min((int)$r['desk_count'], (int)ceil(min(34, (int)$r['desk_count'] * 2) / 2));
-    $roomDesksMap[$r['room_name']] = max(1, $usable);
+    $m = getRoomMetrics($r['room_name'], (int)$r['desk_count']);
+    $roomDesksMap[$r['room_name']] = $m['usable_benches'];
 }
 foreach ($seatRows as $row) {
     $rName = $row['room_name'];
@@ -699,10 +731,44 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 <h2>3. Add Examination Room</h2>
 <form method="post"><input type="hidden" name="action" value="add_room">
 <input type="hidden" name="exam_id" value="<?=h($selectedExam)?>">
-<label>Room name / number</label><input name="room_name" placeholder="e.g. Room 101" required>
-<label>Total desks</label><input type="number" name="desk_count" min="1" required>
-<p class="muted">Capacity is automatically limited to the smaller of 34 students or 2 × desk count.</p>
+<label>Room type</label>
+<select name="room_type" id="room_type" onchange="toggleRoomUnit()">
+  <option value="classroom">Classroom (Desks — 2 seats per desk)</option>
+  <option value="seminar">Seminar Hall (Chairs — 1 seat per chair)</option>
+</select>
+<label>Room name / number</label>
+<input name="room_name" id="room_name" placeholder="e.g. Room 101 or Seminar Hall" oninput="autoDetectSeminar()" required>
+<label id="desk_count_label">Total desks</label>
+<div style="display:flex;gap:8px;align-items:center">
+  <input type="number" name="desk_count" id="desk_count" min="1" required>
+  <button type="button" id="double_desk_btn" class="secondary" style="display:none;margin-top:0;white-space:nowrap" onclick="convertDesksToChairs()" title="Convert entered desk count × 2 into individual chairs">×2 to Chairs</button>
+</div>
+<p class="muted" id="room_cap_hint">Capacity is automatically limited to the smaller of 34 students or 2 × desk count.</p>
 <button type="submit">Add Room</button></form>
+<script>
+function autoDetectSeminar() {
+  const nameVal = document.getElementById('room_name').value.toLowerCase();
+  const typeSel = document.getElementById('room_type');
+  if (nameVal.includes('seminar')) {
+    typeSel.value = 'seminar';
+  }
+  toggleRoomUnit();
+}
+function toggleRoomUnit() {
+  const isSem = document.getElementById('room_type').value === 'seminar' ||
+                document.getElementById('room_name').value.toLowerCase().includes('seminar');
+  document.getElementById('desk_count_label').textContent = isSem ? 'Total chairs' : 'Total desks';
+  document.getElementById('double_desk_btn').style.display = isSem ? 'inline-block' : 'none';
+  document.getElementById('room_cap_hint').textContent = isSem
+    ? 'Seminar Hall mode: counted as individual chairs (1 student per chair, no 34-seat limit). Tip: type 17 and click "×2 to Chairs" for 34 chairs.'
+    : 'Classroom mode: capacity is the smaller of 34 students or 2 × desk count (e.g. 17 desks = 34 seats).';
+}
+function convertDesksToChairs() {
+  const inp = document.getElementById('desk_count');
+  const val = parseInt(inp.value, 10);
+  if (val > 0) inp.value = val * 2;
+}
+</script>
 </section>
 </div>
 
@@ -745,7 +811,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 
 <section class="card no-print">
 <h2>5. Available Rooms</h2>
-<?php if($rooms): ?><table><tr><th>Room</th><th>Desks</th><th>Maximum capacity</th><th>Action</th></tr><?php foreach($rooms as $r): ?><tr><td><?=h($r['room_name'])?></td><td><?=h($r['desk_count'])?></td><td><?=min(34,(int)$r['desk_count']*2)?></td><td><form class="inline" method="post" onsubmit="return confirm('Remove this room?')"><input type="hidden" name="action" value="delete_room"><input type="hidden" name="exam_id" value="<?=h($selectedExam)?>"><input type="hidden" name="room_id" value="<?=h($r['id'])?>"><button class="danger">Remove</button></form></td></tr><?php endforeach; ?></table><?php else: ?><p class="muted">No rooms added yet.</p><?php endif; ?>
+<?php if($rooms): ?><table><tr><th>Room</th><th>Type</th><th>Desks / Chairs</th><th>Maximum capacity</th><th>Action</th></tr><?php foreach($rooms as $r): $rm = getRoomMetrics($r['room_name'], (int)$r['desk_count']); ?><tr><td><?=h($r['room_name'])?></td><td><?=$rm['is_seminar']?'Seminar Hall (Chairs)':'Classroom (Desks)'?></td><td><?=h($r['desk_count'])?> <?=$rm['unit_label']?></td><td><?=$rm['capacity']?></td><td><form class="inline" method="post" onsubmit="return confirm('Remove this room?')"><input type="hidden" name="action" value="delete_room"><input type="hidden" name="exam_id" value="<?=h($selectedExam)?>"><input type="hidden" name="room_id" value="<?=h($r['id'])?>"><button class="danger">Remove</button></form></td></tr><?php endforeach; ?></table><?php else: ?><p class="muted">No rooms added yet.</p><?php endif; ?>
 </section>
 
 <section class="card no-print">
@@ -789,11 +855,12 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
           $hasBenchesInRow = true;
           $rowBenchIndex = $bNo - $startBench + 1;
       ?>
+        <?php $isSemRoom = isSeminarHall($roomName); ?>
         <div class="bench">
-          <strong>Row <?= $rowNum ?> — Bench <?= $rowBenchIndex ?> <span class="muted">(Desk #<?= $bNo ?>)</span></strong>
+          <strong>Row <?= $rowNum ?> — <?= $isSemRoom ? "Chair $rowBenchIndex" : "Bench $rowBenchIndex" ?> <span class="muted">(<?= $isSemRoom ? "Chair #$bNo" : "Desk #$bNo" ?>)</span></strong>
           <?php foreach($benches[$bNo] as $seat): $parsed = parseRegisterNo($seat['register_no']); ?>
             <div class="seat">
-              Seat <?=h($seat['seat_no'])?>: <b><?=h($seat['subject_code'])?></b><br>
+              <?= $isSemRoom ? "Chair #$bNo" : "Seat " . h($seat['seat_no']) ?>: <b><?=h($seat['subject_code'])?></b><br>
               <span class="reg"><?=h($seat['register_no'])?></span><?php if($parsed['is_lateral']): ?><span class="badge-lat">LE</span><?php endif; ?><br>
               <span class="sname"><?=h($seat['student_name'])?></span>
             </div>
@@ -831,7 +898,8 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
         <th style="width:170px">Register Number</th>
         <th>Student Name</th>
         <th style="width:85px">Row</th>
-        <th style="width:95px">Bench</th>
+        <?php $isSemList = isSeminarHall($roomName); ?>
+        <th style="width:95px"><?= $isSemList ? 'Chair' : 'Bench' ?></th>
         <th style="width:70px">Seat</th>
       </tr>
       <?php foreach($stuRows as $idx => $sr):
@@ -845,7 +913,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
         <td><b><?=h($sr['register_no'])?></b><?php if($parsed['is_lateral']): ?><span class="badge-lat">LE</span><?php endif; ?></td>
         <td><?=h($sr['student_name'])?></td>
         <td>Row <?=$rNum?></td>
-        <td>Bench <?=$rbNo?></td>
+        <td><?= $isSemList ? "Chair $rbNo (#$bNo)" : "Bench $rbNo" ?></td>
         <td>Seat <?=h($sr['seat_no'])?></td>
       </tr>
       <?php endforeach; ?>
