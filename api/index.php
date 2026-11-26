@@ -406,30 +406,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             go("Insufficient room capacity. Students: $totalStudents; available capacity: $totalCapacity.", 'error', $examId);
         }
 
-        // Maximum students of a single subject that can sit without same-subject neighbors:
-        // - Classroom: at most 1 student per desk (usable_benches)
-        // - Seminar Hall (1 chair = 1 seat): at most ceil(chairs / 2) so adjacent chairs never share the same subject
-        $maxNonAdjacentSlots = 0;
-        foreach ($roomState as $rs) {
-            $maxNonAdjacentSlots += $rs['is_seminar']
-                ? (int)ceil($rs['usable_benches'] / 2)
-                : $rs['usable_benches'];
-        }
         $totalUsableBenches = array_sum(array_column($roomState, 'usable_benches'));
         $maxSubjectCount = max(array_column($subjects, 'student_count'));
-        if ($maxSubjectCount > $maxNonAdjacentSlots) {
-            go("Cannot separate same-subject students without adjacent bunching: the largest subject has $maxSubjectCount students, " .
-               "which exceeds the maximum non-adjacent seats ($maxNonAdjacentSlots) across all rooms/chairs. Add more rooms or chairs.", 'error', $examId);
-        }
 
         // Fill rooms strictly in Room Number order (Room 1 -> Room 2 -> ...) and Row 1 -> Row 2 -> Row 3.
-        // - In Classrooms: 2 seats per desk, Seat 1 != Seat 2 subject.
-        // - In Seminar Hall: 1 seat per chair, Chair N != Chair (N-1) subject.
+        // Pass 1 (Anti-bunching primary pass):
+        // - In Classrooms: places 1 student per desk for Seat 1, and pairs Seat 2 with a DIFFERENT subject code whenever available.
+        // - In Seminar Hall: places 1 student per chair, alternating subject codes across adjacent chairs whenever available.
+        // Pass 2 (Unavoidable overflow pass when one subject has >50% of total seats, e.g., 154 out of 165 students):
+        // - Any remaining students that exceed single-per-bench / non-adjacent slots are placed into the remaining open seats
+        //   in room order so all students are seated cleanly without failing.
         $remaining = [];
         foreach ($subjects as $s) $remaining[$s['subject_code']] = (int)$s['student_count'];
         $studentIndices = array_fill_keys(array_keys($remaining), 0);
         $placed = 0;
         $benchesRemainingTotal = $totalUsableBenches;
+        $overflowWarningCount = 0;
 
         foreach ($roomState as $rid => &$room) {
             if ($placed >= $totalStudents) break;
@@ -444,7 +436,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $bench = [];
                 $prevBenchSub1 = ($b > 0 && isset($room['benches'][$b - 1][0])) ? $room['benches'][$b - 1][0]['subject'] : null;
 
-                $pickSubject = function (?string $excludeSub, ?string $avoidSameSlotSub = null) use (&$remaining, &$studentQueues, &$studentIndices, &$room, $benchesRemainingTotal): ?string {
+                $pickSubject = function (?string $excludeSub, ?string $avoidSameSlotSub = null) use (&$remaining, &$studentQueues, &$studentIndices, &$room, &$benchesRemainingTotal): ?string {
                     $activeCohortsInRoom = [];
                     foreach ($room['benches'] as $existingBench) {
                         foreach ($existingBench as $existingSeat) {
@@ -493,7 +485,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 };
 
                 // Seat 1 on this bench / Chair
-                // In Seminar Hall, strictly avoid the previous chair's subject ($prevBenchSub1) unless no other subject exists
+                // In Seminar Hall, prefer a different subject from the previous chair ($prevBenchSub1),
+                // falling back to $prevBenchSub1 only if no other subject remains.
                 $sub1 = $room['is_seminar']
                     ? ($pickSubject($prevBenchSub1, null) ?? $pickSubject(null, null))
                     : $pickSubject(null, $prevBenchSub1);
@@ -512,7 +505,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $roomOccupied++;
                 }
 
-                // Seat 2 on the SAME bench (only for 2-seater desks; Seminar Hall has 1 student per chair)
+                // Seat 2 on the SAME bench (only for 2-seater desks; Seminar Hall has 1 student per chair):
+                // Strictly pick a DIFFERENT subject code during Pass 1.
                 if (!$room['is_seminar'] && $placed < $totalStudents && $roomOccupied < $room['capacity'] && $sub1 !== null) {
                     $sub2 = $pickSubject($sub1, null);
                     if ($sub2 !== null) {
@@ -537,6 +531,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
         unset($room);
+
+        // Pass 2: If a dominant subject still has leftover students after filling every single bench/chair once
+        // (for example, 154 students of one subject across 148 benches), seat the remaining students in Seat 2
+        // of benches in room order so everyone gets a seat.
+        if ($placed < $totalStudents) {
+            foreach ($roomState as $rid => &$room) {
+                if ($placed >= $totalStudents) break;
+                if ($room['is_seminar']) continue; // Seminar Hall chairs hold 1 student each
+
+                $roomOccupied = 0;
+                foreach ($room['benches'] as $existingBench) {
+                    $roomOccupied += count($existingBench);
+                }
+
+                for ($b = 0; $b < $room['usable_benches']; $b++) {
+                    if ($placed >= $totalStudents || $roomOccupied >= $room['capacity']) break;
+                    $currentCount = isset($room['benches'][$b]) ? count($room['benches'][$b]) : 0;
+                    if ($currentCount >= 2) continue;
+
+                    // Pick any subject with remaining students
+                    $pickAny = null;
+                    $maxLeft = 0;
+                    foreach ($remaining as $cand => $left) {
+                        if ($left > $maxLeft) {
+                            $maxLeft = $left;
+                            $pickAny = $cand;
+                        }
+                    }
+                    if ($pickAny !== null) {
+                        $stuObj = $studentQueues[$pickAny][$studentIndices[$pickAny]++];
+                        $room['benches'][$b][] = [
+                            'subject' => $pickAny,
+                            'student_no' => $stuObj['student_no'],
+                            'register_no' => $stuObj['register_no'],
+                            'student_name' => $stuObj['student_name'],
+                            'cohort' => $stuObj['cohort']
+                        ];
+                        $remaining[$pickAny]--;
+                        $placed++;
+                        $roomOccupied++;
+                        $overflowWarningCount++;
+                    }
+                }
+            }
+            unset($room);
+        }
 
         if ($placed < $totalStudents) {
             go("Could not seat all students in room order without placing the same subject together. " .
@@ -569,7 +609,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->rollBack();
             go('Could not save seating arrangement: ' . $e->getMessage(), 'error', $examId);
         }
-        go("Seating arrangement generated successfully for $placed students across rooms/chairs without grouping same-subject students together.", 'success', $examId);
+        $doneMsg = $overflowWarningCount > 0
+            ? "Seating arrangement generated for all $placed students in room order (note: $overflowWarningCount excess students of the largest subject had to share benches because the subject count exceeded available single-seat benches)."
+            : "Seating arrangement generated successfully for $placed students across rooms/chairs without grouping same-subject students together.";
+        go($doneMsg, 'success', $examId);
     }
 }
 
