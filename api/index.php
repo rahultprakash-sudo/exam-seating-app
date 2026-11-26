@@ -347,7 +347,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $roomState = [];
         foreach ($rooms as $r) {
             $desks = (int)$r['desk_count'];
-            $cap = min(30, $desks * 2);
+            $cap = min(34, $desks * 2);
             $usableBenches = min($desks, (int)ceil($cap / 2));
             $roomState[$r['id']] = [
                 'id' => (int)$r['id'],
@@ -529,7 +529,7 @@ $byRoom = [];
 $byRoomSubject = [];
 $roomDesksMap = [];
 foreach ($rooms as $r) {
-    $usable = min((int)$r['desk_count'], (int)ceil(min(30, (int)$r['desk_count'] * 2) / 2));
+    $usable = min((int)$r['desk_count'], (int)ceil(min(34, (int)$r['desk_count'] * 2) / 2));
     $roomDesksMap[$r['room_name']] = max(1, $usable);
 }
 foreach ($seatRows as $row) {
@@ -652,7 +652,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 <input type="hidden" name="exam_id" value="<?=h($selectedExam)?>">
 <label>Room name / number</label><input name="room_name" placeholder="e.g. Room 101" required>
 <label>Total desks</label><input type="number" name="desk_count" min="1" required>
-<p class="muted">Capacity is automatically limited to the smaller of 30 students or 2 × desk count.</p>
+<p class="muted">Capacity is automatically limited to the smaller of 34 students or 2 × desk count.</p>
 <button type="submit">Add Room</button></form>
 </section>
 </div>
@@ -696,7 +696,7 @@ details{margin-top:6px}details summary{cursor:pointer;color:var(--blue);font-siz
 
 <section class="card no-print">
 <h2>5. Available Rooms</h2>
-<?php if($rooms): ?><table><tr><th>Room</th><th>Desks</th><th>Maximum capacity</th><th>Action</th></tr><?php foreach($rooms as $r): ?><tr><td><?=h($r['room_name'])?></td><td><?=h($r['desk_count'])?></td><td><?=min(30,(int)$r['desk_count']*2)?></td><td><form class="inline" method="post" onsubmit="return confirm('Remove this room?')"><input type="hidden" name="action" value="delete_room"><input type="hidden" name="exam_id" value="<?=h($selectedExam)?>"><input type="hidden" name="room_id" value="<?=h($r['id'])?>"><button class="danger">Remove</button></form></td></tr><?php endforeach; ?></table><?php else: ?><p class="muted">No rooms added yet.</p><?php endif; ?>
+<?php if($rooms): ?><table><tr><th>Room</th><th>Desks</th><th>Maximum capacity</th><th>Action</th></tr><?php foreach($rooms as $r): ?><tr><td><?=h($r['room_name'])?></td><td><?=h($r['desk_count'])?></td><td><?=min(34,(int)$r['desk_count']*2)?></td><td><form class="inline" method="post" onsubmit="return confirm('Remove this room?')"><input type="hidden" name="action" value="delete_room"><input type="hidden" name="exam_id" value="<?=h($selectedExam)?>"><input type="hidden" name="room_id" value="<?=h($r['id'])?>"><button class="danger">Remove</button></form></td></tr><?php endforeach; ?></table><?php else: ?><p class="muted">No rooms added yet.</p><?php endif; ?>
 </section>
 
 <section class="card no-print">
