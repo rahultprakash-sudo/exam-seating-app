@@ -321,6 +321,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $subjectsStmt->execute([$examId]);
         $subjects = $subjectsStmt->fetchAll();
         $rooms = $pdo->query("SELECT id, room_name, desk_count FROM rooms ORDER BY room_name ASC")->fetchAll();
+        usort($rooms, fn($a, $b) => strnatcasecmp($a['room_name'], $b['room_name']));
 
         if (!$examId || !$subjects || !$rooms) go('Add at least one subject and one room before generating.', 'error', $examId);
 
@@ -365,24 +366,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             go("Insufficient room capacity. Students: $totalStudents; available capacity: $totalCapacity.", 'error', $examId);
         }
 
-        // Fill Room 1 completely (Row 1 -> Row 2 -> Row 3) sequentially before moving to Room 2.
-        // Within every subject stream, IGW students of a Year+Dept are immediately followed by LIGW students
-        // of that SAME Year+Dept, so LIGW stays in the same room whenever seats remain vacant!
+        // Check whether the largest subject exceeds the sum of all other subjects.
+        // Even when one subject has a huge count, each bench can hold at most 1 student of that subject
+        // so same-subject students NEVER sit together on the same bench ("same bunch").
+        $totalUsableBenches = array_sum(array_column($roomState, 'usable_benches'));
+        $maxSubjectCount = max(array_column($subjects, 'student_count'));
+        if ($maxSubjectCount > $totalUsableBenches) {
+            go("Cannot separate same-subject students onto different benches: the largest subject has $maxSubjectCount students, " .
+               "which exceeds the total available benches ($totalUsableBenches) across all rooms. Add more rooms/desks.", 'error', $examId);
+        }
+
+        // Fill rooms strictly in Room Number order (Room 1 -> Room 2 -> ...) and Row 1 -> Row 2 -> Row 3.
+        // To prevent a high-count subject from clustering ("bunching") in later rooms or on the same bench:
+        // 1. Each bench strictly enforces Seat 1 subject != Seat 2 subject (at most 1 student per subject per bench).
+        // 2. When a dominant subject has more remaining students than all other subjects combined,
+        //    we spread the other subjects evenly across rooms/benches or place 1 student per bench so
+        //    same-subject students are never paired together.
+        // 3. Within every subject stream, IGW students of a Year+Dept are immediately followed by LIGW students
+        //    of that SAME Year+Dept.
         $remaining = [];
         foreach ($subjects as $s) $remaining[$s['subject_code']] = (int)$s['student_count'];
         $studentIndices = array_fill_keys(array_keys($remaining), 0);
         $placed = 0;
+
+        // Calculate how many benches remain across all rooms from a given point
+        $benchesRemainingTotal = $totalUsableBenches;
 
         foreach ($roomState as $rid => &$room) {
             if ($placed >= $totalStudents) break;
             $roomOccupied = 0;
 
             for ($b = 0; $b < $room['usable_benches']; $b++) {
-                if ($placed >= $totalStudents || $roomOccupied >= $room['capacity']) break;
+                if ($placed >= $totalStudents || $roomOccupied >= $room['capacity']) {
+                    $benchesRemainingTotal--;
+                    continue;
+                }
 
                 $bench = [];
+                $prevBenchSub1 = ($b > 0 && isset($room['benches'][$b - 1][0])) ? $room['benches'][$b - 1][0]['subject'] : null;
 
-                $pickSubject = function (?string $excludeSub) use (&$remaining, &$studentQueues, &$studentIndices, &$room): ?string {
+                $pickSubject = function (?string $excludeSub, ?string $avoidSameSlotSub = null) use (&$remaining, &$studentQueues, &$studentIndices, &$room, $benchesRemainingTotal): ?string {
                     $activeCohortsInRoom = [];
                     foreach ($room['benches'] as $existingBench) {
                         foreach ($existingBench as $existingSeat) {
@@ -390,17 +413,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
 
+                    // Check if any subject is critically close to needing 1 seat on every remaining bench
+                    $totalRem = array_sum($remaining);
                     $bestSub = null;
                     $bestScore = null;
+
                     foreach ($remaining as $cand => $left) {
                         if ($left <= 0 || $cand === $excludeSub) continue;
                         $nextStu = $studentQueues[$cand][$studentIndices[$cand]];
+
+                        // Priority 1: Must-place if remaining count of this subject >= remaining benches
+                        // (guarantees this subject never overflows and never gets bunched on a single bench)
+                        $mustPlaceNow = ($left >= $benchesRemainingTotal) ? 1 : 0;
+
+                        // Priority 2: Keep LIGW right after IGW of the same Year+Dept in the same room
                         $isSameCohortLigw = ($nextStu['is_lateral'] === 1 && isset($activeCohortsInRoom[$nextStu['cohort']])) ? 1 : 0;
 
+                        // Priority 3: Avoid repeating the exact same subject in Seat 1 of adjacent benches when alternatives exist
+                        $diffFromPrevBench = ($avoidSameSlotSub !== null && $cand !== $avoidSameSlotSub) ? 1 : 0;
+
+                        // Priority 4: Prefer subject with higher remaining share so large subjects are distributed steadily across rooms
                         $score = [
+                            $mustPlaceNow,
                             $isSameCohortLigw,
-                            $nextStu['cohort'],
-                            $left
+                            $left,
+                            $diffFromPrevBench,
+                            $nextStu['cohort']
                         ];
 
                         if ($bestScore === null) {
@@ -410,9 +448,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             if ($score[0] !== $bestScore[0]) {
                                 if ($score[0] > $bestScore[0]) { $bestSub = $cand; $bestScore = $score; }
                             } elseif ($score[1] !== $bestScore[1]) {
-                                if (strcmp($score[1], $bestScore[1]) < 0) { $bestSub = $cand; $bestScore = $score; }
-                            } elseif ($score[2] > $bestScore[2]) {
-                                $bestSub = $cand; $bestScore = $score;
+                                if ($score[1] > $bestScore[1]) { $bestSub = $cand; $bestScore = $score; }
+                            } elseif ($score[2] !== $bestScore[2]) {
+                                if ($score[2] > $bestScore[2]) { $bestSub = $cand; $bestScore = $score; }
+                            } elseif ($score[3] !== $bestScore[3]) {
+                                if ($score[3] > $bestScore[3]) { $bestSub = $cand; $bestScore = $score; }
+                            } elseif (strcmp($score[4], $bestScore[4]) < 0) {
+                                $bestSub = $cand;
+                                $bestScore = $score;
                             }
                         }
                     }
@@ -420,7 +463,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 };
 
                 // Seat 1 on this bench
-                $sub1 = $pickSubject(null);
+                $sub1 = $pickSubject(null, $prevBenchSub1);
                 if ($sub1 !== null) {
                     $stuObj = $studentQueues[$sub1][$studentIndices[$sub1]++];
                     $bench[] = [
@@ -435,9 +478,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $roomOccupied++;
                 }
 
-                // Seat 2 on the SAME bench: DIFFERENT subject
+                // Seat 2 on the SAME bench: strictly a DIFFERENT subject code
+                // If only the same subject code remains, leave Seat 2 vacant on this bench and move to the next bench/room
+                // so same-subject students NEVER sit together in the same bunch.
                 if ($placed < $totalStudents && $roomOccupied < $room['capacity'] && $sub1 !== null) {
-                    $sub2 = $pickSubject($sub1);
+                    $sub2 = $pickSubject($sub1, null);
                     if ($sub2 !== null) {
                         $stuObj = $studentQueues[$sub2][$studentIndices[$sub2]++];
                         $bench[] = [
@@ -456,13 +501,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!empty($bench)) {
                     $room['benches'][$b] = $bench;
                 }
+                $benchesRemainingTotal--;
             }
         }
         unset($room);
 
         if ($placed < $totalStudents) {
-            go("Could not seat all students sequentially without placing the same subject together on a bench. " .
-               "Placed $placed of $totalStudents. Add more rooms/desks or balance subject counts.", 'error', $examId);
+            go("Could not seat all students in room order without placing the same subject together on a bench. " .
+               "Placed $placed of $totalStudents. Add more rooms/desks so each bench has at most 1 student per subject.", 'error', $examId);
         }
 
         $pdo->beginTransaction();
@@ -491,12 +537,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->rollBack();
             go('Could not save seating arrangement: ' . $e->getMessage(), 'error', $examId);
         }
-        // go("Seating arrangement generated successfully for $placed students (IGW followed immediately by same Year & Dept LIGW).", 'success', $examId);
+        go("Seating arrangement generated successfully for $placed students across rooms in room order without grouping same-subject students together.", 'success', $examId);
     }
 }
 
 $exams = $pdo->query("SELECT * FROM exams ORDER BY exam_date DESC, id DESC")->fetchAll();
 $rooms = $pdo->query("SELECT * FROM rooms ORDER BY room_name ASC")->fetchAll();
+usort($rooms, fn($a, $b) => strnatcasecmp($a['room_name'], $b['room_name']));
 $selectedExam = (int)($_GET['exam_id'] ?? ($exams[0]['id'] ?? 0));
 $selected = null;
 foreach ($exams as $e) if ((int)$e['id'] === $selectedExam) $selected = $e;
@@ -519,7 +566,7 @@ if ($selectedExam) {
 }
 $seatRows = [];
 if ($selectedExam) {
-    $st = $pdo->prepare("SELECT s.*, r.room_name, r.desk_count FROM seating s JOIN rooms r ON r.id=s.room_id WHERE s.exam_id=? ORDER BY r.room_name ASC, s.bench_no ASC, s.seat_no ASC");
+    $st = $pdo->prepare("SELECT s.*, r.room_name, r.desk_count FROM seating s JOIN rooms r ON r.id=s.room_id WHERE s.exam_id=? ORDER BY s.bench_no ASC, s.seat_no ASC");
     $st->execute([$selectedExam]);
     $seatRows = $st->fetchAll();
 }
@@ -537,6 +584,8 @@ foreach ($seatRows as $row) {
     $byRoom[$rName][$row['bench_no']][] = $row;
     $byRoomSubject[$rName][$row['subject_code']][] = $row;
 }
+uksort($byRoom, 'strnatcasecmp');
+uksort($byRoomSubject, 'strnatcasecmp');
 // Ensure subject-wise lists inside every room follow Year -> Department -> IGW then LIGW -> Roll Number
 foreach ($byRoomSubject as $rName => &$subGroups) {
     ksort($subGroups);
