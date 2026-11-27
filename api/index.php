@@ -615,7 +615,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         $doneMsg = $overflowWarningCount > 0
             ? "Seating arrangement generated for all $placed students in room order (note: $overflowWarningCount excess students of the largest subject had to share benches because the subject count exceeded available single-seat benches)."
-            : "Seating arrangement generated successfully for $placed students across rooms/chairs without grouping same-subject students together.";
+            : "Seating Arrangement";
         go($doneMsg, 'success', $examId);
     }
 }
